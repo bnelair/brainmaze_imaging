@@ -326,6 +326,18 @@ class TestLoadDicomMetadata:
         val = df["inversion_time_ms"].iloc[0]
         assert val is None or (isinstance(val, float) and np.isnan(val))
 
+    def test_scan_type_mr(self, tmp_path):
+        """MR modality must produce scan_type == 'MRI'."""
+        _write_dicom(_make_mr_dataset(), tmp_path / "s.dcm")
+        df = load_dicom_metadata(tmp_path)
+        assert df["scan_type"].iloc[0] == "MRI"
+
+    def test_scan_type_ct(self, tmp_path):
+        """CT modality must produce scan_type == 'CT'."""
+        _write_dicom(_make_ct_dataset(), tmp_path / "ct.dcm")
+        df = load_dicom_metadata(tmp_path)
+        assert df["scan_type"].iloc[0] == "CT"
+
     def test_mixed_modalities(self, tmp_path):
         mr_dir = tmp_path / "MR"
         ct_dir = tmp_path / "CT"

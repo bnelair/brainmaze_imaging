@@ -84,10 +84,11 @@ DICOM_TAGS: dict[str, str | None] = {
 
     # Modality / Sequence
     "modality":                    "Modality",
+    "scan_type":                   None,
     "image_type":                  "ImageType",
     "series_description":          "SeriesDescription",
     "protocol_name":               "ProtocolName",
-    "sequence_name":               "SequenceName",
+    "sequence_name":               "SequenceName",   # optional tag; often absent in practice
     "scanning_sequence":           "ScanningSequence",
     "sequence_variant":            "SequenceVariant",
     "scan_options":                "ScanOptions",
@@ -211,6 +212,15 @@ def _extract_series_row(ds: pydicom.Dataset) -> dict[str, Any]:
     # Store pixel_spacing as a plain string for DataFrame compatibility
     if isinstance(pixel_spacing, list):
         row["pixel_spacing"] = "\\".join(str(v) for v in pixel_spacing)
+
+    # Derived: scan_type – human-readable modality label
+    # "MR" is the DICOM standard value for MRI; map it to "MRI" for clarity.
+    # All other modality codes (e.g. "CT", "PT", "NM") are kept as-is.
+    modality_val = row.get("modality")
+    if modality_val == "MR":
+        row["scan_type"] = "MRI"
+    elif modality_val is not None:
+        row["scan_type"] = str(modality_val)
 
     return row
 
