@@ -7,14 +7,12 @@ DICOM files are required.
 from __future__ import annotations
 
 import os
-import tempfile
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
-import pydicom
 import pytest
-from pydicom.dataset import Dataset, FileDataset, FileMetaDataset
+from pydicom.dataset import FileDataset, FileMetaDataset
 from pydicom.uid import ExplicitVRLittleEndian, generate_uid
 
 from brainmaze_imaging.dicom.reader import DICOM_TAGS, load_dicom_metadata
@@ -172,7 +170,6 @@ class TestLoadDicomMetadata:
         df = load_dicom_metadata(tmp_path)
         assert isinstance(df, pd.DataFrame)
         assert len(df) == 0
-        # All expected columns must be present
         for col in DICOM_TAGS:
             assert col in df.columns, f"Missing column: {col}"
 
@@ -186,7 +183,7 @@ class TestLoadDicomMetadata:
         with pytest.raises(NotADirectoryError):
             load_dicom_metadata(f)
 
-    def test_single_mr_file(self, tmp_path):
+    def test_single_mr_file_one_row(self, tmp_path):
         ds = _make_mr_dataset(patient_id="P001", series_description="MPRAGE")
         _write_dicom(ds, tmp_path / "slice1.dcm")
 
@@ -197,7 +194,7 @@ class TestLoadDicomMetadata:
         assert df["modality"].iloc[0] == "MR"
         assert df["series_description"].iloc[0] == "MPRAGE"
 
-    def test_mr_file_mri_parameters_present(self, tmp_path):
+    def test_mr_parameters_present(self, tmp_path):
         ds = _make_mr_dataset()
         _write_dicom(ds, tmp_path / "slice1.dcm")
 
@@ -229,7 +226,8 @@ class TestLoadDicomMetadata:
         # FOV = rows * pixel_spacing_row = 256 * 1.0 = 256 mm
         assert float(df["field_of_view_mm"].iloc[0]) == pytest.approx(256.0)
 
-    def test_number_of_slices_per_series(self, tmp_path):
+    def test_multi_slice_series_produces_one_row(self, tmp_path):
+        """A series with 5 DICOM files must produce exactly 1 row."""
         series_uid = generate_uid()
         for i in range(5):
             ds = _make_mr_dataset(series_uid=series_uid, instance_number=i + 1)
@@ -237,10 +235,19 @@ class TestLoadDicomMetadata:
 
         df = load_dicom_metadata(tmp_path)
 
-        assert len(df) == 5
-        assert (df["number_of_slices"] == 5).all()
+        assert len(df) == 1
 
-    def test_multiple_series_slice_count(self, tmp_path):
+    def test_number_of_slices_counted_correctly(self, tmp_path):
+        series_uid = generate_uid()
+        for i in range(5):
+            ds = _make_mr_dataset(series_uid=series_uid, instance_number=i + 1)
+            _write_dicom(ds, tmp_path / f"slice{i}.dcm")
+
+        df = load_dicom_metadata(tmp_path)
+
+        assert int(df["number_of_slices"].iloc[0]) == 5
+
+    def test_two_series_produce_two_rows(self, tmp_path):
         uid_a = generate_uid()
         uid_b = generate_uid()
 
@@ -249,19 +256,16 @@ class TestLoadDicomMetadata:
             _write_dicom(ds, tmp_path / f"seriesA_{i}.dcm")
 
         for i in range(7):
-            ds = _make_mr_dataset(series_uid=uid_b, instance_number=i + 1,
-                                   series_description="FGATIR")
+            ds = _make_mr_dataset(
+                series_uid=uid_b, instance_number=i + 1,
+                series_description="FGATIR",
+            )
             _write_dicom(ds, tmp_path / f"seriesB_{i}.dcm")
 
         df = load_dicom_metadata(tmp_path)
 
-        assert len(df) == 10
-        counts = (
-            df.groupby("series_instance_uid")["number_of_slices"]
-            .first()
-            .sort_values()
-            .tolist()
-        )
+        assert len(df) == 2
+        counts = sorted(df["number_of_slices"].tolist())
         assert counts == [3, 7]
 
     def test_ct_file(self, tmp_path):
@@ -296,7 +300,7 @@ class TestLoadDicomMetadata:
 
         assert len(df) == 1
         assert df["subject_id"].iloc[0] == "NESTED01"
-        assert "subject01" in df["file_path"].iloc[0]
+        assert "subject01" in df["series_dir"].iloc[0]
 
     def test_all_expected_columns_present(self, tmp_path):
         ds = _make_mr_dataset()
@@ -310,7 +314,6 @@ class TestLoadDicomMetadata:
     def test_missing_tags_are_none_or_nan(self, tmp_path):
         """Tags not present in a file should not raise – they become NaN/None."""
         ds = _make_mr_dataset()
-        # Remove a tag that is normally present
         if hasattr(ds, "InversionTime"):
             del ds.InversionTime
 
@@ -341,10 +344,35 @@ class TestLoadDicomMetadata:
         df = load_dicom_metadata(tmp_path)
         assert isinstance(df, pd.DataFrame)
 
-    def test_file_path_column_is_absolute(self, tmp_path):
+    def test_series_files_is_list_of_absolute_paths(self, tmp_path):
+        series_uid = generate_uid()
+        for i in range(3):
+            ds = _make_mr_dataset(series_uid=series_uid, instance_number=i + 1)
+            _write_dicom(ds, tmp_path / f"slice{i}.dcm")
+
+        df = load_dicom_metadata(tmp_path)
+
+        files = df["series_files"].iloc[0]
+        assert isinstance(files, list)
+        assert len(files) == 3
+        for p in files:
+            assert os.path.isabs(p)
+
+    def test_series_dir_is_absolute(self, tmp_path):
         _write_dicom(_make_mr_dataset(), tmp_path / "s.dcm")
         df = load_dicom_metadata(tmp_path)
-        assert os.path.isabs(df["file_path"].iloc[0])
+        assert os.path.isabs(df["series_dir"].iloc[0])
+
+    def test_series_files_sorted(self, tmp_path):
+        """series_files list must be in sorted order."""
+        series_uid = generate_uid()
+        for i in range(4):
+            ds = _make_mr_dataset(series_uid=series_uid, instance_number=i + 1)
+            _write_dicom(ds, tmp_path / f"slice{i:03d}.dcm")
+
+        df = load_dicom_metadata(tmp_path)
+        files = df["series_files"].iloc[0]
+        assert files == sorted(files)
 
     def test_dti_b_value(self, tmp_path):
         ds = _make_mr_dataset(series_description="DTI_64DIR")
@@ -364,3 +392,34 @@ class TestLoadDicomMetadata:
         df_path = load_dicom_metadata(tmp_path)
 
         assert len(df_str) == len(df_path) == 1
+
+    def test_metadata_taken_from_first_file_in_series(self, tmp_path):
+        """All slices share the same series-level metadata; result must match."""
+        series_uid = generate_uid()
+        for i in range(4):
+            ds = _make_mr_dataset(
+                series_uid=series_uid,
+                patient_id="PATMETA",
+                series_description="INNER EAR",
+                instance_number=i + 1,
+            )
+            _write_dicom(ds, tmp_path / f"s{i}.dcm")
+
+        df = load_dicom_metadata(tmp_path)
+
+        assert df["subject_id"].iloc[0] == "PATMETA"
+        assert df["series_description"].iloc[0] == "INNER EAR"
+
+    def test_slice_specific_columns_absent(self, tmp_path):
+        """SOPInstanceUID, InstanceNumber, SliceLocation, ImagePositionPatient
+        are slice-specific and must not appear as top-level columns."""
+        _write_dicom(_make_mr_dataset(), tmp_path / "s.dcm")
+        df = load_dicom_metadata(tmp_path)
+
+        for removed_col in (
+            "sop_instance_uid",
+            "instance_number",
+            "slice_location",
+            "image_position_patient",
+        ):
+            assert removed_col not in df.columns, f"Column should not exist: {removed_col}"
