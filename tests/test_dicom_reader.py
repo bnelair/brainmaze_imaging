@@ -248,19 +248,21 @@ class TestLoadDicomMetadata:
         assert int(df["number_of_slices"].iloc[0]) == 5
 
     def test_two_series_produce_two_rows(self, tmp_path):
-        uid_a = generate_uid()
-        uid_b = generate_uid()
+        dir_a = tmp_path / "series_A"
+        dir_b = tmp_path / "series_B"
+        dir_a.mkdir()
+        dir_b.mkdir()
 
         for i in range(3):
-            ds = _make_mr_dataset(series_uid=uid_a, instance_number=i + 1)
-            _write_dicom(ds, tmp_path / f"seriesA_{i}.dcm")
+            ds = _make_mr_dataset(instance_number=i + 1)
+            _write_dicom(ds, dir_a / f"slice{i}.dcm")
 
         for i in range(7):
             ds = _make_mr_dataset(
-                series_uid=uid_b, instance_number=i + 1,
+                instance_number=i + 1,
                 series_description="FGATIR",
             )
-            _write_dicom(ds, tmp_path / f"seriesB_{i}.dcm")
+            _write_dicom(ds, dir_b / f"slice{i}.dcm")
 
         df = load_dicom_metadata(tmp_path)
 
@@ -344,35 +346,25 @@ class TestLoadDicomMetadata:
         df = load_dicom_metadata(tmp_path)
         assert isinstance(df, pd.DataFrame)
 
-    def test_series_files_is_list_of_absolute_paths(self, tmp_path):
-        series_uid = generate_uid()
-        for i in range(3):
-            ds = _make_mr_dataset(series_uid=series_uid, instance_number=i + 1)
-            _write_dicom(ds, tmp_path / f"slice{i}.dcm")
-
-        df = load_dicom_metadata(tmp_path)
-
-        files = df["series_files"].iloc[0]
-        assert isinstance(files, list)
-        assert len(files) == 3
-        for p in files:
-            assert os.path.isabs(p)
-
     def test_series_dir_is_absolute(self, tmp_path):
         _write_dicom(_make_mr_dataset(), tmp_path / "s.dcm")
         df = load_dicom_metadata(tmp_path)
         assert os.path.isabs(df["series_dir"].iloc[0])
 
-    def test_series_files_sorted(self, tmp_path):
-        """series_files list must be in sorted order."""
+    def test_series_size_bytes_estimate(self, tmp_path):
+        """size estimate = number_of_slices * size_of_representative_file (> 0)."""
         series_uid = generate_uid()
         for i in range(4):
             ds = _make_mr_dataset(series_uid=series_uid, instance_number=i + 1)
-            _write_dicom(ds, tmp_path / f"slice{i:03d}.dcm")
+            _write_dicom(ds, tmp_path / f"slice{i}.dcm")
 
         df = load_dicom_metadata(tmp_path)
-        files = df["series_files"].iloc[0]
-        assert files == sorted(files)
+
+        est = df["series_size_bytes_estimate"].iloc[0]
+        assert est > 0
+        # Estimate must be a multiple of one representative file size
+        rep_size = (tmp_path / "slice0.dcm").stat().st_size
+        assert est == 4 * rep_size
 
     def test_dti_b_value(self, tmp_path):
         ds = _make_mr_dataset(series_description="DTI_64DIR")
@@ -411,8 +403,8 @@ class TestLoadDicomMetadata:
         assert df["series_description"].iloc[0] == "INNER EAR"
 
     def test_slice_specific_columns_absent(self, tmp_path):
-        """SOPInstanceUID, InstanceNumber, SliceLocation, ImagePositionPatient
-        are slice-specific and must not appear as top-level columns."""
+        """SOPInstanceUID, InstanceNumber, SliceLocation, ImagePositionPatient,
+        and series_files are not present as top-level columns."""
         _write_dicom(_make_mr_dataset(), tmp_path / "s.dcm")
         df = load_dicom_metadata(tmp_path)
 
@@ -421,5 +413,6 @@ class TestLoadDicomMetadata:
             "instance_number",
             "slice_location",
             "image_position_patient",
+            "series_files",
         ):
             assert removed_col not in df.columns, f"Column should not exist: {removed_col}"

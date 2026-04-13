@@ -1,9 +1,15 @@
 """
 DICOM metadata reader.
 
-Recursively walks a directory tree, reads every DICOM file it finds, groups
-files by series (``SeriesInstanceUID``), and returns a
-:class:`pandas.DataFrame` where **each row represents one scan / series**.
+Recursively walks a directory tree and returns a :class:`pandas.DataFrame`
+where **each row represents one scan / series** (one directory of DICOM files).
+
+For efficiency the reader processes only **one representative DICOM file per
+series directory** to extract metadata.  The total number of files in that
+directory is reported as ``number_of_slices`` and a fast size estimate
+(``series_size_bytes_estimate``) is computed as
+``number_of_slices × representative_file_size``.  This makes the function
+practical even for datasets with hundreds of scans and thousands of slices.
 
 The tag selection follows the same conventions used by **dcm2niix** so that the
 resulting DataFrame is immediately useful for quality-control workflows and for
@@ -13,7 +19,7 @@ Typical usage
 -------------
 >>> from brainmaze_imaging.dicom import load_dicom_metadata
 >>> df = load_dicom_metadata("/path/to/dicom/root")
->>> print(df[["subject_id", "series_description", "number_of_slices"]])
+>>> print(df[["subject_id", "series_description", "number_of_slices", "series_size_bytes_estimate"]])
 """
 
 from __future__ import annotations
@@ -97,7 +103,6 @@ DICOM_TAGS: dict[str, str | None] = {
     "reconstruction_diameter_mm":  "ReconstructionDiameter",
     "field_of_view_mm":            None,
     "image_orientation_patient":   "ImageOrientationPatient",
-    "number_of_slices":            None,
 
     # MRI timing / contrast
     "repetition_time_ms":          "RepetitionTime",
@@ -143,7 +148,8 @@ DICOM_TAGS: dict[str, str | None] = {
 
     # Series file information (always populated)
     "series_dir":                  None,
-    "series_files":                None,
+    "number_of_slices":            None,
+    "series_size_bytes_estimate":  None,
 }
 
 
@@ -161,19 +167,18 @@ def _safe_get(ds: pydicom.Dataset, keyword: str) -> Any:
         return None
 
 
-def _extract_file_row(ds: pydicom.Dataset, file_path: Path) -> dict[str, Any]:
-    """Extract all configured tags from a single DICOM dataset.
+def _extract_series_row(ds: pydicom.Dataset) -> dict[str, Any]:
+    """Extract all configured tags from a representative DICOM dataset.
 
-    Returns a dict keyed by the column names in :data:`DICOM_TAGS` plus an
-    internal ``_file_path`` entry used for series grouping.  The derived
-    columns (``number_of_slices``, ``series_dir``, ``series_files``) are
-    left as ``None`` here and filled during series aggregation.
+    The derived columns (``number_of_slices``, ``series_dir``,
+    ``series_size_bytes_estimate``) are left as ``None`` here and filled
+    by the caller after counting files and measuring disk usage.
     """
     row: dict[str, Any] = {}
 
     for col, keyword in DICOM_TAGS.items():
         if keyword is None:
-            row[col] = None  # derived – filled during aggregation
+            row[col] = None  # derived – filled by caller
         else:
             row[col] = _safe_get(ds, keyword)
 
@@ -207,63 +212,27 @@ def _extract_file_row(ds: pydicom.Dataset, file_path: Path) -> dict[str, Any]:
     if isinstance(pixel_spacing, list):
         row["pixel_spacing"] = "\\".join(str(v) for v in pixel_spacing)
 
-    # Internal field used only for grouping – not exposed in output
-    row["_file_path"] = str(file_path)
-
     return row
 
 
-def _series_key(row: dict[str, Any]) -> str:
-    """Return a grouping key for *row*.
+def _read_representative(
+    candidates: list[Path],
+    force: bool = False,
+) -> tuple[dict[str, Any] | None, Path | None]:
+    """Try files in sorted order until a valid DICOM is found.
 
-    Prefers ``SeriesInstanceUID`` for correctness; falls back to the parent
-    directory of the file so that old DICOM files without a UID are still
-    grouped sensibly.
+    Returns ``(row_dict, representative_path)`` on success, or
+    ``(None, None)`` if no valid DICOM exists among *candidates*.
+    Only the headers are read (``stop_before_pixels=True``), keeping
+    I/O minimal.
     """
-    uid = row.get("series_instance_uid")
-    if uid:
-        return str(uid)
-    return str(Path(row["_file_path"]).parent)
-
-
-def _is_null(val: Any) -> bool:
-    """Return True if *val* should be treated as absent/null."""
-    if val is None:
-        return True
-    if isinstance(val, float) and np.isnan(val):
-        return True
-    return False
-
-
-def _aggregate_series(file_rows: list[dict[str, Any]]) -> dict[str, Any]:
-    """Collapse a list of per-file metadata dicts into one series-level row.
-
-    For each metadata column the first non-null value found across all files
-    in the series is used.  File paths are collected into a sorted list
-    (``series_files``) and the common directory is stored in ``series_dir``.
-    """
-    result: dict[str, Any] = {}
-
-    metadata_cols = [
-        col for col in DICOM_TAGS
-        if col not in ("number_of_slices", "series_dir", "series_files")
-    ]
-
-    for col in metadata_cols:
-        result[col] = None
-        for row in file_rows:
-            val = row.get(col)
-            if not _is_null(val):
-                result[col] = val
-                break
-
-    # Derived: file list, directory, number of slices
-    all_paths = sorted(row["_file_path"] for row in file_rows)
-    result["series_files"] = all_paths
-    result["series_dir"] = str(Path(all_paths[0]).parent) if all_paths else None
-    result["number_of_slices"] = len(all_paths)
-
-    return result
+    for path in sorted(candidates):
+        try:
+            ds = pydicom.dcmread(str(path), stop_before_pixels=True, force=force)
+            return _extract_series_row(ds), path
+        except (InvalidDicomError, OSError, PermissionError, ValueError):
+            continue
+    return None, None
 
 
 def load_dicom_metadata(
@@ -275,12 +244,14 @@ def load_dicom_metadata(
 ) -> pd.DataFrame:
     """Recursively scan *root* for DICOM files and return a per-series DataFrame.
 
-    DICOM files are discovered recursively under *root*, grouped by
-    ``SeriesInstanceUID`` (or by folder when the UID is absent), and
-    aggregated so that **each row represents exactly one scan / series**.
-    Slice-specific attributes (instance number, position, etc.) are not
-    included; instead the full list of file paths for each series is stored
-    in the ``series_files`` column and the count in ``number_of_slices``.
+    Files are grouped by their **parent directory** – one row is produced per
+    directory that contains at least one valid DICOM file.  Only a **single
+    representative file** (the first valid DICOM in sorted filename order) is
+    parsed for metadata, making the function fast even for large datasets.
+
+    ``number_of_slices`` is the total count of regular files in that directory
+    (a fast OS-level count, no file parsing).  ``series_size_bytes_estimate``
+    is ``number_of_slices × representative_file_size``.
 
     Parameters
     ----------
@@ -295,15 +266,14 @@ def load_dicom_metadata(
         standard DICOM preamble are also attempted.  Useful for older scanners.
     show_progress:
         If ``True`` and the optional *tqdm* package is installed, a progress
-        bar is displayed while scanning.
+        bar is displayed while scanning directories.
 
     Returns
     -------
     pandas.DataFrame
-        One row per DICOM series (scan).  Columns are defined by
+        One row per DICOM series directory.  Columns are defined by
         :data:`DICOM_TAGS`.  All columns are nullable; absent tags produce
-        ``None`` / ``NaN``.  The ``series_files`` column contains a Python
-        list of absolute file paths that belong to that series.
+        ``None`` / ``NaN``.
 
     Raises
     ------
@@ -316,7 +286,7 @@ def load_dicom_metadata(
     --------
     >>> from brainmaze_imaging.dicom import load_dicom_metadata
     >>> df = load_dicom_metadata("/data/dicoms")
-    >>> print(df[["subject_id", "series_description", "number_of_slices"]])
+    >>> print(df[["subject_id", "series_description", "number_of_slices", "series_size_bytes_estimate"]])
     """
     root_path = Path(root)
     if not root_path.exists():
@@ -324,49 +294,51 @@ def load_dicom_metadata(
     if not root_path.is_dir():
         raise NotADirectoryError(f"Expected a directory, got: {root_path}")
 
-    candidate_files = [
-        p for p in root_path.glob(glob_pattern) if p.is_file()
-    ]
+    # ── Group candidate files by parent directory (no file reads yet) ────────
+    dir_files: dict[Path, list[Path]] = {}
+    for p in root_path.glob(glob_pattern):
+        if p.is_file():
+            dir_files.setdefault(p.parent, []).append(p)
 
+    if not dir_files:
+        logger.warning("No files found under %s", root_path)
+        return pd.DataFrame(columns=list(DICOM_TAGS.keys()))
+
+    directories = list(dir_files.keys())
     if show_progress:
         try:
             from tqdm import tqdm  # type: ignore
-            candidate_files = tqdm(candidate_files, desc="Reading DICOM files", unit="file")
+            directories = tqdm(directories, desc="Reading series directories", unit="dir")
         except ImportError:
             logger.warning("tqdm not installed; progress bar unavailable.")
 
-    file_rows: list[dict[str, Any]] = []
-    skipped = 0
+    series_rows: list[dict[str, Any]] = []
+    skipped_dirs = 0
 
-    for file_path in candidate_files:
-        try:
-            ds = pydicom.dcmread(
-                str(file_path),
-                stop_before_pixels=True,
-                force=force,
-            )
-            file_rows.append(_extract_file_row(ds, file_path))
-        except InvalidDicomError:
-            skipped += 1
-            logger.debug("Skipping non-DICOM file: %s", file_path)
-        except (OSError, PermissionError, ValueError) as exc:
-            skipped += 1
-            logger.warning("Error reading %s: %s", file_path, exc)
+    for dir_path in directories:
+        candidates = dir_files[dir_path]
+        row, rep_path = _read_representative(candidates, force=force)
 
-    if skipped:
-        logger.info("Skipped %d non-DICOM / unreadable files.", skipped)
+        if row is None:
+            skipped_dirs += 1
+            logger.debug("No valid DICOM found in %s", dir_path)
+            continue
 
-    if not file_rows:
-        logger.warning("No DICOM files found under %s", root_path)
+        n_files = len(candidates)
+        rep_size = rep_path.stat().st_size  # type: ignore[union-attr]
+
+        row["series_dir"] = str(dir_path)
+        row["number_of_slices"] = n_files
+        row["series_size_bytes_estimate"] = n_files * rep_size
+
+        series_rows.append(row)
+
+    if skipped_dirs:
+        logger.info("Skipped %d directories with no valid DICOM files.", skipped_dirs)
+
+    if not series_rows:
+        logger.warning("No DICOM series found under %s", root_path)
         return pd.DataFrame(columns=list(DICOM_TAGS.keys()))
-
-    # Group by series and aggregate to one row per series
-    series_groups: dict[str, list[dict[str, Any]]] = {}
-    for row in file_rows:
-        key = _series_key(row)
-        series_groups.setdefault(key, []).append(row)
-
-    series_rows = [_aggregate_series(group) for group in series_groups.values()]
 
     df = pd.DataFrame(series_rows)
 
