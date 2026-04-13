@@ -1,0 +1,42 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "brainmaze_imaging"
+version = "0.1.0"
+description = "A package for exploration and data conversion of DICOM datasets."
+readme = "README.md"
+license = { file = "LICENSE" }
+requires-python = ">=3.13"
+keywords = ["dicom", "mri", "ct", "neuroimaging", "nifti"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Science/Research",
+    "Topic :: Scientific/Engineering :: Medical Science Apps.",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.13",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+]
+dependencies = [
+    "pydicom>=2.4",
+    "pandas>=2.0",
+    "numpy>=1.26",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "pytest-cov>=5.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/bnelair/brainmaze_imaging"
+Issues = "https://github.com/bnelair/brainmaze_imaging/issues"
+
+[tool.hatch.build.targets.wheel]
+packages = ["brainmaze_imaging"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
